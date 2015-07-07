@@ -433,6 +433,9 @@ void *iotest(void *thread_data_array)
 	if (i_write) data->loop = writefile(fd);
 	if (i_read) data->loop = readfile(fd);
 
+    if (fsync(fd) != 0)
+      if (errno != EINTR) fprintf(stderr, "fsync failed for %s\n", name);
+
 	data->time = gettime() - start;
 	cpu = sched_getcpu();
 
