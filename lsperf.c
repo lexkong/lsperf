@@ -60,7 +60,6 @@ int main(int argc, char *argv[])
 	int i, loop, rc;
 	void *status;
 	pthread_attr_t attr;
-	printf("KONGCC\n");exit(0);
 	strcpy(i_format, "B/s");
 	parse_option(argc, argv);
 
@@ -161,7 +160,7 @@ void parse_option(int argc, char *argv[])
 {
 	int opt, size;
 	char c;
-	char options[] = "b:dDf:hj:rRs;STvVw";
+	char options[] = "b:dDf:hj:rRs:STvVw";
 
 	while ((opt = getopt(argc, argv, options)) != -1) {
 		switch(opt) {
