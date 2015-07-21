@@ -1,4 +1,4 @@
-#define LSPERFVERSION "0.2.0"
+#define LSPERFVERSION "0.3.0"
 #ifdef DEBUGLSPERF
 void DebugOutput(int area, int level, char *format,...);
 #define DEBUG_MAIN 0
@@ -27,7 +27,9 @@ int DebugArea,DebugLevel;
 #define kE 1000
 #define mE 1000000
 #define gE 1000000000
+#define AIO_MAXIO 256
 
+#include <libaio.h>
 #include <stdarg.h>
 #include <ctype.h>
 #include <pthread.h>
@@ -95,6 +97,8 @@ static long long pagesize;
 pthread_mutex_t mutex;
 
 pthread_barrier_t psync1,psync2,psync3;
+static int aio_engine = 0;
+static int iodepth = 1;
 
 void CmdLine(int argc, char* argv[]);
 void Usage(char *argv);
@@ -105,6 +109,7 @@ int ReadFile(int FD,struct thread_data *thread_data_array);
 long long GetTime();
 long double Format(long double io);
 void *IOtest(void *thread_data_array);
+void *AIOtest(void *thread_data_array);
 int get_device(int major, int minor, char *device);
 int get_fs(char *cwd, char *fs);
 int get_scheduler(char *device, char* scheduler, long long *dsize);
@@ -112,6 +117,9 @@ int ClearCache();
 long long unsigned get_total_cpu();
 int get_task_cpu(long long unsigned *system, long long unsigned *user);
 int get_nr_cpu();
+void SubmitRead(int offset);
+void *Reap(void *p);
+static void io_error(const char *, int);
 
 int
 main(int argc, char* argv[])
@@ -176,7 +184,7 @@ main(int argc, char* argv[])
     if (strlen(comment)) printf("\n Comment: %s\n",comment);
     printf("\n Actual date and time          : %s",ctime(&ltime));
     if (Write)
-      printf("\n Running test                  : write");
+		printf("\n Running test                  : write");
     else
       printf("\n Running test                  : read");
     if (! gethostname(hostname,STRLEN))
@@ -206,6 +214,7 @@ main(int argc, char* argv[])
   {
     if (Direct) printf(" Flag O_DIRECT set\n");
     if (SynFlag) printf(" Flag O_SYNC set\n");
+	if (aio_engine) printf(" Use AIO engine\n");
     if (Fsync) printf(" Using fsync\n");
     if (Unique && NrThreads > 1)
        printf("\n Using unique filename         : %s\n",FileName);
@@ -224,7 +233,11 @@ main(int argc, char* argv[])
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
 
-    rc = pthread_create(&thread[i], &attr, IOtest, (void *)&thread_data_array[i]);
+	if (aio_engine)
+		rc = pthread_create(&thread[i], &attr, AIOtest, (void *)&thread_data_array[i]);
+	else
+		rc = pthread_create(&thread[i], &attr, IOtest, (void *)&thread_data_array[i]);
+
     if (rc)
     {
       printf("ERROR; return code from pthread_create() is %d\n", rc);
@@ -391,6 +404,8 @@ Usage(char *argv)
   printf("\n -v             : Verbose mode");
   printf("\n -V             : Print version and exit");
   printf("\n -w             : Open file for writing");
+  printf("\n -i             : Set iodepth for AIO engine");
+  printf("\n -A             : Use AIO engine");
   printf("\n\n Be aware: You have to use either '-r' or '-w'!\n\n");
   exit(0);
 }
@@ -405,7 +420,7 @@ CmdLine(int argc, char* argv[])
   char *d;
   int i;
 #endif
-  char options[]="b:B:c:Cd:Df:Fhj:l:L:orRs:StTUvVw";
+  char options[]="b:B:c:Cd:Df:Fhj:l:L:orRs:StTUvVwi:A";
 
   while((opt = getopt(argc, argv, options)) != -1)
   {
@@ -566,7 +581,14 @@ CmdLine(int argc, char* argv[])
         Write=1;
         break;
 
-      default:
+	case 'A':
+		aio_engine = 1;
+		break;
+	case 'i':
+		iodepth = atoi(optarg);
+		break;
+
+	default:
         Usage(argv[0]);
     }
   }
@@ -593,7 +615,7 @@ OpenFile(char * name,int threadid)
     if (Trunc) flags |= O_TRUNC;
   }
   if (SynFlag) flags |= O_SYNC;
-  if (Direct)
+  if (Direct || aio_engine)
   {
 #ifdef O_DIRECT
     flags |= O_DIRECT;
@@ -687,6 +709,7 @@ OpenFile(char * name,int threadid)
 
 /* Get the memory buffer and fill it up before read/write */
 int
+
 GetMemory(long long bs)
 {
   long long start;
@@ -703,7 +726,7 @@ GetMemory(long long bs)
   pagesize=getpagesize();
 
   /* only needed for O_DIRECT? */
-  if ((bs%pagesize) && (Direct))
+  if ((bs%pagesize) && (Direct || aio_engine))
   {
     printf("\n WARNING: buffersize is not modulo pagesize %Li\n\n",pagesize);
     //exit(-1);
@@ -854,7 +877,6 @@ WriteFile(int FD,struct thread_data *data)
 #ifdef DEBUGLSPERF
   long double duration;
 #endif
-
   if (count==0)
   {
     printf("File size not set, use -s <size>!\n");
@@ -1065,6 +1087,127 @@ IOtest(void *thread_data_array)
   close(FD);
 
   return(0);
+}
+
+/* Do the real AIO test */
+void *
+AIOtest(void *thread_data_array)
+{
+	struct thread_data *data;
+	char name[STRLEN];
+	int cpu,FD,threadid;
+	fileinfo fi;
+
+	long long count = FileSize, start, totaltime = 0;
+	size_t block = BlockSize;
+	int loop = 0;
+	long long offset = 0;
+	long iter = 0;
+	int i = 0;
+	io_context_t myctx;
+
+#ifdef DEBUGLSPERF
+	long double duration;
+#endif
+
+
+	data=(struct thread_data *) thread_data_array;
+	threadid=data->threadid;
+	data->cpu=sched_getcpu();
+	DEBUGP(DebugOutput(DEBUG_IO,1," Thread %i: Running on CPU: %i\n",data->threadid, data->cpu););
+
+	/* if we have one thread, use the real given filename
+	 * otherwise add the thread number to the file
+	 */
+	if ((NrThreads==1) || Unique)
+		strcpy(name,FileName);
+	else
+		sprintf(name,"%s%i",FileName,threadid);
+
+	DEBUGP(DebugOutput(DEBUG_IO,2," Using file name: %s\n",name););
+
+	fi=OpenFile(name,threadid);
+	FD=fi.FD;
+
+	/* wait for synchronized start */
+	if (pthread_barrier_wait(&psync1)==PTHREAD_BARRIER_SERIAL_THREAD)
+	{
+		if (Verbose>1) printf("\n Starting threads!\n");
+	}
+
+	memset(&myctx, 0, sizeof(myctx));
+	if (0 != io_setup(AIO_MAXIO, &myctx)) {
+		perror("Could not initialize io queue");
+		exit(-1);
+	}
+
+	while (count) {
+		if (count < BlockSize) {
+			block = count;
+			iodepth = 1;
+		}
+
+		iter = count / BlockSize;
+
+		if (iter == 0) iter = 1;
+		if (iter < iodepth) {
+			printf("Warning: iodepth < iter\n");
+			iodepth = iter;
+		}
+
+		struct iocb *ioq[iodepth];
+		struct io_event events[iodepth];
+		struct io_event *ep;
+		int n;
+
+		start = GetTime();
+		for (i = 0; i < iodepth; i++) {
+			loop++;
+			struct iocb *io = (struct iocb*)malloc(sizeof(struct iocb));
+			io_prep_pwrite(io, FD, membuf, block, offset);
+
+			ioq[i] = io;
+			offset += block;
+		}
+
+		//if (Verbose) printf("AIO prepare done, now submitting...\n");
+
+		if (iodepth != io_submit(myctx, iodepth, ioq)) {
+			perror("Failure on submit.");
+			exit(-1);
+		}
+
+		//if (Verbose) printf("Now awaiting completion..\n");
+
+		n = io_getevents(myctx, iodepth, iodepth, events, NULL);
+
+		for (ep = events; n-- > 0; ep++) {
+			struct iocb *iocb = ep->obj;
+			if (ep->res2 != 0) io_error("aio write", ep->res2);
+			if (ep->res != iocb->u.c.nbytes) {
+				printf("write missed bytes expect %lu got %ld\n", iocb->u.c.nbytes, ep->res);
+			}
+
+			count -= iocb->u.c.nbytes;
+			loop++;
+		}
+
+		totaltime += GetTime() - start;
+	}
+
+	data->time = totaltime;
+	cpu=sched_getcpu();
+	if (cpu != data->cpu)
+	{
+		if (Verbose>1) printf(" CPU of thread %i changed from %i to %i\n",
+							  threadid, data->cpu, cpu);
+		data->cpu=cpu;
+	}
+
+	close(FD);
+	io_destroy(myctx);
+	data->loop = loop;
+	return(0);
 }
 
 /* find the device the file is located on */
@@ -1456,4 +1599,16 @@ get_nr_cpu()
   free(line);
   fclose(fp);
   return(cpu+1);
+}
+
+static void io_error(const char *func, int rc)
+{
+	if (rc == -ENOSYS)
+		printf("AIO not in this kernel");
+	else if (rc < 0)
+		printf("%s: %s\n", func, strerror(-rc));
+	else
+		printf("%s: error %d\n", func, rc);
+
+	exit(-1);
 }

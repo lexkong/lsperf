@@ -1,8 +1,8 @@
 all: lsperf.c
-	gcc -Wall -O2 -o lsperf lsperf.c -pthread -lrt
+	gcc -Wall -O2 -o lsperf lsperf.c -pthread -lrt -laio
 
 debug: lsperf.c
-	gcc -Wall -g -DDEBUGLSPERF -o lsperf lsperf.c -pthread -lrt
+	gcc -Wall -g -DDEBUGLSPERF -o lsperf lsperf.c -pthread -lrt -laio
 
 install: lsperf lsperf.1
 	cp lsperf.1 /usr/local/man/man1/
