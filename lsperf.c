@@ -106,6 +106,8 @@ fileinfo OpenFile(char *name,int threadid);
 int GetMemory(long long bs);
 int WriteFile(int FD,struct thread_data *thread_data_array);
 int ReadFile(int FD,struct thread_data *thread_data_array);
+int AIOWriteFile(int FD,struct thread_data *thread_data_array);
+int AIOReadFile(int FD,struct thread_data *thread_data_array);
 long long GetTime();
 long double Format(long double io);
 void *IOtest(void *thread_data_array);
@@ -214,7 +216,7 @@ main(int argc, char* argv[])
   {
     if (Direct) printf(" Flag O_DIRECT set\n");
     if (SynFlag) printf(" Flag O_SYNC set\n");
-	if (aio_engine) printf(" Use AIO engine\n");
+	if (aio_engine) printf(" Using AIO engine\n");
     if (Fsync) printf(" Using fsync\n");
     if (Unique && NrThreads > 1)
        printf("\n Using unique filename         : %s\n",FileName);
@@ -583,6 +585,7 @@ CmdLine(int argc, char* argv[])
 
 	case 'A':
 		aio_engine = 1;
+		Direct = 1;
 		break;
 	case 'i':
 		iodepth = atoi(optarg);
@@ -615,7 +618,7 @@ OpenFile(char * name,int threadid)
     if (Trunc) flags |= O_TRUNC;
   }
   if (SynFlag) flags |= O_SYNC;
-  if (Direct || aio_engine)
+  if (Direct)
   {
 #ifdef O_DIRECT
     flags |= O_DIRECT;
@@ -726,7 +729,7 @@ GetMemory(long long bs)
   pagesize=getpagesize();
 
   /* only needed for O_DIRECT? */
-  if ((bs%pagesize) && (Direct || aio_engine))
+  if ((bs%pagesize) && Direct)
   {
     printf("\n WARNING: buffersize is not modulo pagesize %Li\n\n",pagesize);
     //exit(-1);
@@ -1098,18 +1101,13 @@ AIOtest(void *thread_data_array)
 	int cpu,FD,threadid;
 	fileinfo fi;
 
-	long long count = FileSize, start, totaltime = 0;
-	size_t block = BlockSize;
-	int loop = 0;
-	long long offset = 0;
-	long iter = 0;
-	int i = 0;
-	io_context_t myctx;
-
-#ifdef DEBUGLSPERF
-	long double duration;
-#endif
-
+//	long long count = FileSize, start, totaltime = 0;
+//	size_t block = BlockSize;
+//	int loop = 0;
+//	long long offset = 0;
+//	long iter = 0;
+//	int i = 0;
+//	io_context_t myctx;
 
 	data=(struct thread_data *) thread_data_array;
 	threadid=data->threadid;
@@ -1135,67 +1133,10 @@ AIOtest(void *thread_data_array)
 		if (Verbose>1) printf("\n Starting threads!\n");
 	}
 
-	memset(&myctx, 0, sizeof(myctx));
-	if (0 != io_setup(AIO_MAXIO, &myctx)) {
-		perror("Could not initialize io queue");
-		exit(-1);
-	}
+	// KONG
+	if (Write && FileSize) data->loop=AIOWriteFile(FD, thread_data_array);
+	if (Read && FileSize) data->loop=AIOReadFile(FD, thread_data_array);
 
-	while (count) {
-		if (count < BlockSize) {
-			block = count;
-			iodepth = 1;
-		}
-
-		iter = count / BlockSize;
-
-		if (iter == 0) iter = 1;
-		if (iter < iodepth) {
-			printf("Warning: iodepth < iter\n");
-			iodepth = iter;
-		}
-
-		struct iocb *ioq[iodepth];
-		struct io_event events[iodepth];
-		struct io_event *ep;
-		int n;
-
-		start = GetTime();
-		for (i = 0; i < iodepth; i++) {
-			loop++;
-			struct iocb *io = (struct iocb*)malloc(sizeof(struct iocb));
-			io_prep_pwrite(io, FD, membuf, block, offset);
-
-			ioq[i] = io;
-			offset += block;
-		}
-
-		//if (Verbose) printf("AIO prepare done, now submitting...\n");
-
-		if (iodepth != io_submit(myctx, iodepth, ioq)) {
-			perror("Failure on submit.");
-			exit(-1);
-		}
-
-		//if (Verbose) printf("Now awaiting completion..\n");
-
-		n = io_getevents(myctx, iodepth, iodepth, events, NULL);
-
-		for (ep = events; n-- > 0; ep++) {
-			struct iocb *iocb = ep->obj;
-			if (ep->res2 != 0) io_error("aio write", ep->res2);
-			if (ep->res != iocb->u.c.nbytes) {
-				printf("write missed bytes expect %lu got %ld\n", iocb->u.c.nbytes, ep->res);
-			}
-
-			count -= iocb->u.c.nbytes;
-			loop++;
-		}
-
-		totaltime += GetTime() - start;
-	}
-
-	data->time = totaltime;
 	cpu=sched_getcpu();
 	if (cpu != data->cpu)
 	{
@@ -1205,8 +1146,6 @@ AIOtest(void *thread_data_array)
 	}
 
 	close(FD);
-	io_destroy(myctx);
-	data->loop = loop;
 	return(0);
 }
 
@@ -1611,4 +1550,170 @@ static void io_error(const char *func, int rc)
 		printf("%s: error %d\n", func, rc);
 
 	exit(-1);
+}
+
+int AIOWriteFile(int FD, struct thread_data *data)
+{
+	long long totaltime = 0;
+	int loop = 0;
+	long long offset = 0;
+	long iter = 0;
+	int i = 0;
+	io_context_t myctx;
+	long long count = FileSize;
+	size_t block = BlockSize;
+	long long start;
+
+#ifdef DEBUGLSPERF
+	long double duration;
+#endif
+
+	memset(&myctx, 0, sizeof(myctx));
+	if (0 != io_setup(AIO_MAXIO, &myctx)) {
+		perror("Could not initialize io queue");
+		exit(-1);
+	}
+
+	while (count) {
+		if (count < BlockSize) {
+			block = count;
+			iodepth = 1;
+		}
+
+		iter = count / block;
+
+		if (iter < iodepth) {
+			printf("Warning: iodepth < iter\n");
+			iodepth = iter;
+		}
+
+		struct iocb *ioq[iodepth];
+		struct io_event events[iodepth];
+		struct io_event *ep;
+		int n;
+
+		start = GetTime();
+		for (i = 0; i < iodepth; i++) {
+			struct iocb *io = (struct iocb*)malloc(sizeof(struct iocb));
+			io_prep_pwrite(io, FD, membuf, block, offset);
+
+			ioq[i] = io;
+			offset += block;
+		}
+
+		//if (Verbose) printf("AIO prepare done, now submitting...\n");
+
+		if (iodepth != io_submit(myctx, iodepth, ioq)) {
+			perror("Failure on submit.");
+			exit(-1);
+		}
+
+		//if (Verbose) printf("Now awaiting completion..\n");
+
+		n = io_getevents(myctx, iodepth, iodepth, events, NULL);
+
+		for (ep = events; n-- > 0; ep++) {
+			struct iocb *iocb = ep->obj;
+			if (ep->res2 != 0) io_error("aio write", ep->res2);
+			if (ep->res != iocb->u.c.nbytes) {
+				printf("write missed bytes expect %lu got %ld\n", iocb->u.c.nbytes, ep->res);
+			}
+
+			count -= iocb->u.c.nbytes;
+			loop++;
+		}
+
+		totaltime += GetTime() - start;
+	}
+
+	data->time = totaltime;
+	io_destroy(myctx);
+
+	return (loop);
+}
+
+/* libaio read function */
+int AIOReadFile(int FD,struct thread_data *data)
+{
+	long long totaltime = 0, start;
+	int loop = 0;
+	long long offset = 0;
+	long iter = 0;
+	int i = 0;
+	io_context_t myctx;
+	long long count = 0;
+	size_t block = BlockSize;
+	int endless=0;
+
+#ifdef DEBUGLSPERF
+	long double duration;
+#endif
+
+
+	memset(&myctx, 0, sizeof(myctx));
+	if (0 != io_setup(AIO_MAXIO, &myctx)) {
+		perror("Could not initialize io queue");
+		exit(-1);
+	}
+
+	if (FileSize == 0) endless = 1;
+
+	while (endless || count < FileSize) {
+		if ((FileSize > 0) && (count + BlockSize > FileSize)) {
+			block = FileSize - count;
+		}
+
+		if ((FileSize - count) < BlockSize) {
+			block = FileSize - count;
+			iodepth = 1;
+		}
+
+		iter = (FileSize - count) / block;
+		if (iter < iodepth) {
+			printf("Warning: iodepth < iter\n");
+			iodepth = iter;
+		}
+
+		struct iocb *ioq[iodepth];
+		struct io_event events[iodepth];
+		struct io_event *ep;
+		int n;
+
+		start = GetTime();
+		for (i = 0; i < iodepth; i++) {
+			struct iocb *io = (struct iocb*)malloc(sizeof(struct iocb));
+			io_prep_pread(io, FD, membuf, block, offset);
+
+			ioq[i] = io;
+			offset += block;
+		}
+
+		//if (Verbose) printf("AIO prepare done, now submitting...\n");
+
+		if (iodepth != io_submit(myctx, iodepth, ioq)) {
+			perror("Failure on submit.");
+			exit(-1);
+		}
+
+		//if (Verbose) printf("Now awaiting completion..\n");
+
+		n = io_getevents(myctx, iodepth, iodepth, events, NULL);
+
+		for (ep = events; n-- > 0; ep++) {
+			struct iocb *iocb = ep->obj;
+			if (ep->res2 != 0) io_error("aio write", ep->res2);
+			if (ep->res != iocb->u.c.nbytes) {
+				printf("write missed bytes expect %lu got %ld\n", iocb->u.c.nbytes, ep->res);
+			}
+
+			count += iocb->u.c.nbytes;
+			loop++;
+		}
+
+		totaltime += GetTime() - start;
+	}
+
+	data->time = totaltime;
+	io_destroy(myctx);
+	return (loop);
 }
