@@ -46,6 +46,7 @@ int DebugArea,DebugLevel;
 #include <sys/utsname.h>
 #include <signal.h>
 #include <malloc.h>
+#include <unistd.h>
 
 #define STRLEN 4096        /* max length for strings */
 
@@ -99,6 +100,8 @@ pthread_mutex_t mutex;
 pthread_barrier_t psync1,psync2,psync3;
 static int aio_engine = 0;
 static int iodepth = 1;
+static int Percent = 0;
+static int RandomFlag = 0;
 
 void CmdLine(int argc, char* argv[]);
 void Usage(char *argv);
@@ -218,6 +221,7 @@ main(int argc, char* argv[])
     if (SynFlag) printf(" Flag O_SYNC set\n");
 	if (aio_engine) printf(" Using AIO engine\n");
     if (Fsync) printf(" Using fsync\n");
+	if (Random) printf(" Testing random IO\n");
     if (Unique && NrThreads > 1)
        printf("\n Using unique filename         : %s\n",FileName);
   }
@@ -408,6 +412,8 @@ Usage(char *argv)
   printf("\n -w             : Open file for writing");
   printf("\n -i             : Set iodepth for AIO engine");
   printf("\n -A             : Use AIO engine");
+  printf("\n -p Percent     : write/read");
+  printf("\n -E             : Random write/read");
   printf("\n\n Be aware: You have to use either '-r' or '-w'!\n\n");
   exit(0);
 }
@@ -422,7 +428,7 @@ CmdLine(int argc, char* argv[])
   char *d;
   int i;
 #endif
-  char options[]="b:B:c:Cd:Df:Fhj:l:L:orRs:StTUvVwi:A";
+  char options[]="b:B:c:Cd:Df:Fhj:l:L:orRs:StTUvVwi:Ap:E";
 
   while((opt = getopt(argc, argv, options)) != -1)
   {
@@ -464,7 +470,7 @@ CmdLine(int argc, char* argv[])
         break;
 
       case 'R':
-        Random=1;
+        RandomFlag=1;
         DEBUGP(DebugOutput(DEBUG_CMD,1,"Enabled Random buffer filling\n");)
         break;
 
@@ -589,6 +595,14 @@ CmdLine(int argc, char* argv[])
 		break;
 	case 'i':
 		iodepth = atoi(optarg);
+		break;
+
+	case 'p':
+		Percent = atoi(optarg);
+		break;
+
+	case 'E':
+		RandomFlag = 1;
 		break;
 
 	default:
@@ -754,6 +768,7 @@ GetMemory(long long bs)
   DEBUGP(DebugOutput(DEBUG_MEM,5,"pagesize: %Li\n", pagesize););
   DEBUGP(DebugOutput(DEBUG_MEM,5,"Allocated memory: %Li at %p\n", bs,membuf););
   if (Verbose) printf(" Buffer size                   : %Li Bytes\n",bs);
+  if (Verbose) printf(" Iodepth                       : %d\n",iodepth);
 
   start=GetTime();
 
@@ -877,6 +892,9 @@ WriteFile(int FD,struct thread_data *data)
   size_t block=BlockSize;
   long long wb;
   int loop=0;
+  long long offset = 0;
+  off64_t  numrecs64 = (off64_t)(FileSize/BlockSize);
+
 #ifdef DEBUGLSPERF
   long double duration;
 #endif
@@ -886,12 +904,24 @@ WriteFile(int FD,struct thread_data *data)
     exit(-1);
   }
 
+  if (RandomFlag) srand48(0);
+
   while (count)
   {
     if (count < BlockSize)
     {
       block=count;
     }
+
+	if (RandomFlag) {
+		offset = block * (lrand48()%numrecs64);
+
+		if (lseek(FD, offset, 0) < 0) {
+			perror("lseek");
+			exit(68);
+		}
+	}
+
     start=GetTime();
     wb=write(FD,membuf,block);
     stop = GetTime()-start;
@@ -945,25 +975,39 @@ ReadFile(int FD,struct thread_data *data)
   long long wb;
   int endless=0;
   int loop=0;
+  long long offset = 0;
+  off64_t  numrecs64 = (off64_t)(FileSize/BlockSize);
+
 #ifdef DEBUGLSPERF
   long double duration;
 #endif
 
   if (FileSize==0) endless=1;
+  if (RandomFlag) srand48(0);
 
-  while (endless || count< FileSize)
+  while (endless || count < FileSize)
   {
     if ((FileSize >0) && (count+BlockSize > FileSize)  )
     {
-      block=FileSize-count;
-    }
-    start=GetTime();
-    wb=read(FD,membuf,block);
-    stop=GetTime()-start;
-    loop++;
+		block=FileSize-count;
+	}
+
+	if (RandomFlag) {
+		offset = block * (lrand48()%numrecs64);
+
+		if (lseek(FD, offset, 0) < 0) {
+			perror("lseek");
+			exit(68);
+		}
+	}
+
+	start=GetTime();
+	wb = read(FD,membuf,block);
+	stop=GetTime()-start;
+	loop++;
 	if ( (mintime==0) || (stop<mintime) )  mintime=stop;
 	if ( stop> maxtime )  maxtime=stop;
-    totaltime+=stop;
+	totaltime+=stop;
 
 #ifdef DEBUGLSPERF
     duration=(long double)(stop)/gE;
@@ -983,7 +1027,7 @@ ReadFile(int FD,struct thread_data *data)
       printf("Failed to read full block (%Li): %Li\n", (long long) block, wb);
     }
     if (wb==0) { FileSize=count; return(loop);}
-    count+=wb;
+    count += wb;
   }
 
   if (loop>1 && Verbose ) // && NrThreads==1)
@@ -1066,6 +1110,7 @@ IOtest(void *thread_data_array)
 
   if (CCache) ClearCache();
   start=GetTime();
+
   if (Write && FileSize) data->loop=WriteFile(FD,thread_data_array);
   if (Read && FileSize) data->loop=ReadFile(FD,thread_data_array);
   if (Fsync)
@@ -1133,7 +1178,6 @@ AIOtest(void *thread_data_array)
 		if (Verbose>1) printf("\n Starting threads!\n");
 	}
 
-	// KONG
 	if (Write && FileSize) data->loop=AIOWriteFile(FD, thread_data_array);
 	if (Read && FileSize) data->loop=AIOReadFile(FD, thread_data_array);
 
@@ -1563,6 +1607,7 @@ int AIOWriteFile(int FD, struct thread_data *data)
 	long long count = FileSize;
 	size_t block = BlockSize;
 	long long start;
+	off64_t  numrecs64 = (off64_t)(FileSize/BlockSize);
 
 #ifdef DEBUGLSPERF
 	long double duration;
@@ -1573,6 +1618,8 @@ int AIOWriteFile(int FD, struct thread_data *data)
 		perror("Could not initialize io queue");
 		exit(-1);
 	}
+
+	if (RandomFlag) srand48(0);
 
 	while (count) {
 		if (count < BlockSize) {
@@ -1591,6 +1638,15 @@ int AIOWriteFile(int FD, struct thread_data *data)
 		struct io_event events[iodepth];
 		struct io_event *ep;
 		int n;
+
+		if (RandomFlag) {
+			offset = block * (lrand48()%numrecs64);
+
+			if (lseek(FD, offset, 0) < 0) {
+				perror("lseek");
+				exit(68);
+			}
+		}
 
 		start = GetTime();
 		for (i = 0; i < iodepth; i++) {
@@ -1644,11 +1700,11 @@ int AIOReadFile(int FD,struct thread_data *data)
 	long long count = 0;
 	size_t block = BlockSize;
 	int endless=0;
+	off64_t  numrecs64 = (off64_t)(FileSize/BlockSize);
 
 #ifdef DEBUGLSPERF
 	long double duration;
 #endif
-
 
 	memset(&myctx, 0, sizeof(myctx));
 	if (0 != io_setup(AIO_MAXIO, &myctx)) {
@@ -1657,7 +1713,7 @@ int AIOReadFile(int FD,struct thread_data *data)
 	}
 
 	if (FileSize == 0) endless = 1;
-
+	if (RandomFlag) srand48(0);
 	while (endless || count < FileSize) {
 		if ((FileSize > 0) && (count + BlockSize > FileSize)) {
 			block = FileSize - count;
@@ -1678,6 +1734,15 @@ int AIOReadFile(int FD,struct thread_data *data)
 		struct io_event events[iodepth];
 		struct io_event *ep;
 		int n;
+
+		if (RandomFlag) {
+			offset = block * (lrand48()%numrecs64);
+
+			if (lseek(FD, offset, 0) < 0) {
+				perror("lseek");
+				exit(68);
+			}
+		}
 
 		start = GetTime();
 		for (i = 0; i < iodepth; i++) {
